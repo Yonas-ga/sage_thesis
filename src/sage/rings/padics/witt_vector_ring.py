@@ -1478,7 +1478,6 @@ class WittVectorRing_standard(WittVectorRingClass):
 
             sage: TestSuite(W).run()
         """
-        super().__init__(coefficient_ring, prec, prime)
         self._always_coerce = []
         self._coerce_when_different = [WittVectorRingClass]
 

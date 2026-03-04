@@ -7,13 +7,13 @@ Witt vectors.
 AUTHORS:
 
 - Jacob Dennerlein (2022-11-28): initial version
-- Rubén Muñoz-\-Bertrand (2025-02-13): major refactoring and clean-up
-
+- Rubén Muñoz-\-Bertrand (2025-02-13, 2025-12-23): major refactoring and
+  new features
 """
 
 # ****************************************************************************
 #       Copyright (C) 2025 Rubén Muñoz--Bertrand
-#                          <ruben.munoz--bertrand@univ-fcomte.fr>
+#                          <ruben.munoz-bertrand@inria.fr>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,15 +21,20 @@ AUTHORS:
 # (at your option) any later version.
 #                  https://www.gnu.org/licenses/
 # ****************************************************************************
-from itertools import product
-from collections.abc import Iterator
 
+
+from collections.abc import Iterator
+from itertools import product
+
+from sage.categories.commutative_additive_groups import CommutativeAdditiveGroups
 from sage.categories.commutative_rings import CommutativeRings
-from sage.categories.integral_domains import IntegralDomains
 from sage.categories.fields import Fields
+from sage.categories.homset import Hom
+from sage.categories.integral_domains import IntegralDomains
 from sage.misc.latex import latex
 from sage.rings.integer import Integer
 from sage.rings.integer_ring import ZZ
+from sage.rings.morphism import RingHomomorphism, RingMap
 from sage.rings.padics.factory import Zp
 from sage.rings.padics.witt_vector import (
     WittVector_finotti,
@@ -42,6 +47,7 @@ from sage.rings.polynomial.multi_polynomial_ring_base import MPolynomialRing_bas
 from sage.rings.polynomial.polynomial_element import Polynomial
 from sage.rings.polynomial.polynomial_ring import PolynomialRing_generic
 from sage.rings.polynomial.polynomial_ring_constructor import PolynomialRing
+from sage.sets.primes import Primes
 from sage.structure.parent import Parent
 from sage.sets.primes import Primes
 from sage.structure.factory import UniqueFactory
@@ -121,30 +127,33 @@ def fast_char_p_power(x, n, p=None):
 
 class WittVectorRingFactory(UniqueFactory):
     r"""
-        Return a Factory that creates and stores all truncated Witt vector rings.
-        
-        Send directly to the appropriate constructor of WittVectorRingClass for each algorithm
-        Except: `standard` where the Witt's Polynomials for `p` of `ZZ` are cached,
-        in order to be reused in the computation of the Witt's Polynomials of any ring `R`
-        for the same prime `p`
+        Factory that creates and stores all truncated Witt vector rings.
+
+        Send directly to the appropriate constructor of WittVectorRingClass for each algorithm.
+        Except: `algorithm="standard"`, where the Witt's Polynomials for `p` of `\ZZ` are cached,
+        in order to be reused in the computation of the Witt Polynomials of any ring `R`,
+        for the same prime `p`.
     """
     def __init__(self, name):
         r"""
         Initialize such a Factory as described above.
-        
+
             EXAMPLES::
 
-            sage: from sage.rings.padics.witt_vector_ring import WittVectorRing
-            sage: isinstance(WittVectorRing, object)
+            sage: from sage.rings.padics.witt_vector_ring import WittVectorRingClass
+            sage: W = WittVectorRing(GF(5), p=31, prec=1)
+            sage: isinstance(W, WittVectorRingClass)
             True
         """
         super().__init__(name)
         self._witt_polynomials = {}
+        self._frob_polynomials = {}
+        self._binomial_table = {}
 
     def create_key(self, coefficient_ring, prec=1, p=None, algorithm=None):
         r"""
         Normalise and validate inputs to create the factory cache key.
-        
+
         INPUT:
 
         - ``coefficient_ring`` -- a commutative ring
@@ -155,12 +164,13 @@ class WittVectorRingFactory(UniqueFactory):
         OUTPUT:
 
         A tuple ``(coefficient_ring, prec, p, algorithm)`` suitable for caching.
-        
+
         EXAMPLES::
 
-            sage: from sage.rings.padics.witt_vector_ring import WittVectorRing
-            sage: WittVectorRing(GF(5), prec=2)  # indirect doctest
-            Ring of truncated 5-typical Witt vectors of length 2 over Finite Field of size 5
+            sage: WittVectorRing.create_key(ZZ, p=2)
+            (Integer Ring, 1, 2, 'standard')
+            sage: WittVectorRing.create_key(QQ[x], prec=1, p=5)
+            (Univariate Polynomial Ring in x over Rational Field, 1, 5, 'p_invertible')
         """
         if coefficient_ring not in CommutativeRings():
             raise TypeError(f"{coefficient_ring} is not a commutative ring")
@@ -180,23 +190,20 @@ class WittVectorRingFactory(UniqueFactory):
         elif p not in Primes():
             raise ValueError(f"p must be a prime number, here {p} was given")
 
-        match algorithm:
-            case None:
-                if p == char:
-                    if (coefficient_ring in Fields().Finite()
-                        or isinstance(coefficient_ring,
-                                      PolynomialRing_generic)
-                        and coefficient_ring.base()
-                            in Fields().Finite()):
-                        algorithm = 'phantom'
-                    else:
-                        algorithm = 'finotti'
-                elif coefficient_ring(p).is_unit():
-                    algorithm = 'p_invertible'
+        if algorithm is None:
+            if p == char:
+                if (coefficient_ring in Fields().Finite()
+                    or isinstance(coefficient_ring, PolynomialRing_generic)
+                    and coefficient_ring.base() in Fields().Finite()):
+                    algorithm = 'phantom'
                 else:
-                    algorithm = 'standard'
-            case _ if algorithm not in ['standard','p_invertible', 'finotti', 'phantom']:
-                raise ValueError("algorithm must be one of None, 'standard', "
+                    algorithm = 'finotti'
+            elif coefficient_ring(p).is_unit():
+                algorithm = 'p_invertible'
+            else:
+                algorithm = 'standard'
+        elif algorithm not in ['standard', 'p_invertible', 'finotti', 'phantom']:
+            raise ValueError("algorithm must be one of None, 'standard', "
                                  "'p_invertible', 'finotti', 'phantom'")
         return (coefficient_ring, prec, p, algorithm)
 
@@ -214,48 +221,54 @@ class WittVectorRingFactory(UniqueFactory):
         match algorithm:
             case 'finotti':
                 child = WittVectorRing_finotti
+                if p in self._binomial_table:
+                    if prec >= len(self._binomial_table[p]):
+                        self._compute_binomial_table(prec, p)
+                else:
+                    self._compute_binomial_table(prec, p)
             case 'phantom':
                 child = WittVectorRing_phantom
             case 'p_invertible':
                 child = WittVectorRing_pinvertible
             case 'standard':
                 child = WittVectorRing_standard
-        if child != WittVectorRing_standard:
-            return child(coefficient_ring, prec, p)
-
-        if p in self._witt_polynomials:
-            if prec > len(self._witt_polynomials[p][0]):
-                self._generate_sum_and_product_polynomials_list(prec, p)
-        else:
-            self._generate_sum_and_product_polynomials_list(prec, p)
+                if p in self._witt_polynomials:
+                    if prec > len(self._witt_polynomials[p][0]):
+                        self._generate_sum_and_product_polynomials_list(prec, p)
+                else:
+                    self._generate_sum_and_product_polynomials_list(prec, p)
 
         return child(coefficient_ring, prec, p)
 
     def _generate_sum_and_product_polynomials_list(self, prec, p):
         """
         Generate the sum and product polynomials defining the ring laws of
-        truncated Witt vectors for the ``standard`` algorithm, of the ZZ
-        ring. This method is used as an auxiliary for the computation of
-        the truncated Witt vectors of a ring R.
-        
+        truncated Witt vectors, of the integer ring.
+        This method is used as an auxiliary for the computation of
+        the truncated Witt vectors of a ring `R`.
+
         EXAMPLES::
 
-            sage: from sage.rings.padics.witt_vector_ring import WittVectorRing
-            sage: F = WittVectorRing  # the global factory instance
-
             sage: p = 2
-            sage: p in F._witt_polynomials
+            sage: p in WittVectorRing._witt_polynomials
             False
 
-            sage: F._generate_sum_and_product_polynomials_list(2, p)
-            sage: p in F._witt_polynomials
+            sage: WittVectorRing._generate_sum_and_product_polynomials_list(2, p)
+            sage: p in WittVectorRing._witt_polynomials
             True
-            sage: len(F._witt_polynomials[p][0]), len(F._witt_polynomials[p][1])
+            sage: len(WittVectorRing._witt_polynomials[p][0]), len(WittVectorRing._witt_polynomials[p][1])
             (2, 2)
 
-            sage: F._generate_sum_and_product_polynomials_list(4, p)
-            sage: len(F._witt_polynomials[p][0]), len(F._witt_polynomials[p][1])
+            sage: WittVectorRing._generate_sum_and_product_polynomials_list(4, p)
+            sage: len(WittVectorRing._witt_polynomials[p][0]), len(WittVectorRing._witt_polynomials[p][1])
             (4, 4)
+            sage: WittVectorRing._witt_polynomials[p][0][2]
+            -X0^3*Y0 - 2*X0^2*Y0^2 - X0*Y0^3 + X0*X1*Y0 + X0*Y0*Y1 - X1*Y1 + X2 + Y2
+
+            sage: len(WittVectorRing._frob_polynomials[p])
+            3
+            sage: WittVectorRing._frob_polynomials[p][2]
+            -2*X0^6*X1 - 8*X0^4*X1^2 - 10*X0^2*X1^3 - 4*X1^4 + 4*X0^2*X1*X2 + 2*X1^2*X2 - X2^2 + 2*X3
         """
         x_var_names = [f'X{i}' for i in range(prec)]
         y_var_names = [f'Y{i}' for i in range(prec)]
@@ -289,12 +302,15 @@ class WittVectorRingFactory(UniqueFactory):
         if p in self._witt_polynomials: # We want to extend, not create
             start = len(self._witt_polynomials[p][0])
             start_prod = start
+            start_frob = max(start,2)
             self._witt_polynomials[p][0] += [0]*(prec-start)
             self._witt_polynomials[p][1] += [0]*(prec-start)
         else:
             start = 0
             start_prod = 1
+            start_frob = 2
             self._witt_polynomials[p] = [[0]*(prec), [x_vars[0] * y_vars[0]] + [0]*(prec-1)]
+            self._frob_polynomials[p] = []
 
         for n in range(start, prec):
             s_n = x_vars[n] + y_vars[n]
@@ -310,6 +326,80 @@ class WittVectorRingFactory(UniqueFactory):
                          for i in range(n)])
             p_n = (x_poly*y_poly - p_poly) // p**n
             self._witt_polynomials[p][1][n] = p_n
+
+        R = PolynomialRing(ZZ, x_var_names, implementation=implementation)
+        x_vars = R.gens()
+
+        if not prec.is_one():
+            if self._frob_polynomials[p] == []:
+                self._frob_polynomials[p] = [x_vars[0]**p + p*x_vars[1]]
+            for n in range(start_frob, prec):
+                x_poly = sum([p**i * x_vars[i]**(p**(n-i)) for i in range(n+1)])
+                p_poly = sum([p**i * self._frob_polynomials[p][i]**(p**(n-1-i))
+                              for i in range(n-1)])
+                self._frob_polynomials[p].append((x_poly - p_poly) / p**(n-1))
+
+    def _compute_binomial_table(self, prec, prime):
+        """
+        Auxiliary function for WittVectorRing_finotti, initializing the binomial table.
+
+        EXAMPLES::
+
+            sage: WittVectorRing._compute_binomial_table(3,2)
+            sage: WittVectorRing._binomial_table[2]
+            [[0], array([0, 1]), array([0, 1, 0, 1]), array([0, 1, 0, 1, 1, 1, 0, 1])]
+            sage: WittVectorRing._compute_binomial_table(5,2)
+            sage: WittVectorRing._binomial_table[2]
+            [[0],
+            array([0, 1]),
+            array([0, 1, 0, 1]),
+            array([0, 1, 0, 1, 1, 1, 0, 1]),
+            array([0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1]),
+            array([0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    0, 1, 1, 1, 1, 1, 0, 1, 0, 1])]
+
+            sage: WW = WittVectorRing(GF(5), p=5, prec=2, algorithm="finotti")
+            sage: WittVectorRing._binomial_table
+            {2: [[0],
+            array([0, 1]),
+            array([0, 1, 0, 1]),
+            array([0, 1, 0, 1, 1, 1, 0, 1]),
+            array([0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1]),
+            array([0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+                    0, 1, 1, 1, 1, 1, 0, 1, 0, 1])],
+            5: [[0],
+            array([0, 4, 3, 3, 4]),
+            array([0, 4, 3, 3, 4, 0, 1, 2, 2, 1, 1, 4, 3, 3, 4, 1, 1, 2, 2, 1, 0, 4,
+                    3, 3, 4])]}
+        """
+        if prime in self._binomial_table: # Extend binomial table
+            start = len(self._binomial_table[prime])
+            table = self._binomial_table[prime]
+        else:
+            start = 1
+            table = [[0]]
+        import numpy as np
+        R = Zp(prime, prec=prec+1, type='fixed-mod')
+        v_p = ZZ.valuation(prime)
+        for k in range(start, prec+1):
+            pk = prime**k
+            row = np.empty(pk, dtype=int)
+            row[0] = 0
+            prev_bin = 1
+            for i in range(1, pk // 2 + 1):
+                val = v_p(i)
+                # Instead of calling binomial each time, we compute the
+                # coefficients recursively. This is MUCH faster.
+                next_bin = prev_bin * (pk - (i-1)) // i
+                prev_bin = next_bin
+                series = R(-next_bin // prime**(k-val))
+                for _ in range(val):
+                    temp = series % prime
+                    series = (series - R.teichmuller(temp)) // prime
+                row[i] = ZZ(series % prime)
+                row[pk - i] = row[i]  # binomial coefficients are symmetric
+            table.append(row)
+        self._binomial_table[prime] = table
 
 
 WittVectorRing = WittVectorRingFactory("WittVectorRing")
@@ -342,7 +432,7 @@ class WittVectorRingClass(Parent):
 
     - ``phantom`` -- computes the ring laws using the phantom components
       using a lift of ``coefficient_ring``, assuming that it is either
-      `\mathbb F_q` for a power `q` of `p`, or a polynomial ring on that field;
+      `\GF{q}` for a power `q` of `p`, or a polynomial ring on that field;
 
     - ``p_invertible`` -- uses some optimisations when `p` is invertible
       in the coefficient ring.
@@ -370,6 +460,41 @@ class WittVectorRingClass(Parent):
         sage: WittVectorRing(Qp(7), prec=30, p=5)
         Ring of truncated 5-typical Witt vectors of length 30 over
         7-adic Field with capped relative precision 20
+
+    ::
+
+        sage: p = 5
+        sage: W = WittVectorRing(ZZ, prec=3, p=p)
+        sage: W
+        Ring of truncated 5-typical Witt vectors of length 3 over Integer Ring
+        sage: V = W.verschiebung(extend=True)
+        sage: WW = V.codomain()
+        sage: WW
+        Ring of truncated 5-typical Witt vectors of length 4 over Integer Ring
+        sage: F = WW.frobenius_morphism()
+        sage: w = W.random_element(x=-100, y=100)
+        sage: w  # random
+        (-13, 20, -33)
+        sage: p*w == F(V(w))
+        True
+
+    ::
+
+        sage: p = 7
+        sage: W = WittVectorRing(GF(p)['x,y'], prec=5)
+        sage: W
+        Ring of truncated 7-typical Witt vectors of length 5 over Multivariate
+        Polynomial Ring in x, y over Finite Field of size 7
+        sage: V = W.verschiebung()
+        sage: F = W.frobenius_morphism()
+        sage: w = W.random_element()
+        sage: w  # random
+        (-3*x^2 + 2*y^2 - 3*y + 2, -2*x*y - y^2 - y - 2, -x^2 + y^2,
+        x^2 + 2*y^2 + 3*x + y, 2*x^2 - 3*x*y + y^2 + y + 1)
+        sage: p*w == F(V(w))
+        True
+        sage: p*w == V(F(w))
+        True
 
     TESTS::
 
@@ -405,7 +530,7 @@ class WittVectorRingClass(Parent):
         sage: W
         Ring of truncated 5-typical Witt vectors of length 1 over Rational Field
     """
-    def __init__(self, coefficient_ring, prec, prime) -> None:
+    def __init__(self, coefficient_ring, prec, prime, algorithm) -> None:
         r"""
         Initialise ``self``.
 
@@ -418,17 +543,26 @@ class WittVectorRingClass(Parent):
 
             sage: TestSuite(W).run()
         """
-        cring = coefficient_ring
-        self._coefficient_ring = cring
+        self._coefficient_ring = coefficient_ring
         self._prec = prec
         self._prime = prime
 
-        if prec == 1 and cring in IntegralDomains():
+        if prec.is_one() and coefficient_ring in Fields():
+            cat = Fields()
+        elif prec.is_one() and coefficient_ring in IntegralDomains():
             cat = IntegralDomains()
         else:
             cat = CommutativeRings()
 
-        Parent.__init__(self, base=ZZ, category=cat)
+        if coefficient_ring.base_ring() is coefficient_ring:
+            base = self
+        else:
+            base = WittVectorRing(coefficient_ring.base_ring(), prec=prec,
+                                  p=prime, algorithm=algorithm)
+
+        names = tuple('V' + x for x in coefficient_ring.variable_names())
+
+        Parent.__init__(self, base=base, category=cat, names=names)
 
     def __iter__(self) -> Iterator:
         """
@@ -503,7 +637,7 @@ class WittVectorRingClass(Parent):
         if S is ZZ:
             return True
 
-    def _generate_sum_and_product_polynomials(self, coefficient_ring, prec, p):
+    def _generate_witt_polynomials(self, coefficient_ring, prec, p):
         """
         Generate the sum and product polynomials defining the ring laws of
         truncated Witt vectors for the ``standard`` algorithm.
@@ -516,47 +650,50 @@ class WittVectorRingClass(Parent):
             (X1 + Y1, -X1^2*Y1 - X1*Y1^2 + X2 + Y2)
             sage: W([X1,X2]) * W([Y1,Y2])  # indirect doctest
             (X1*Y1, X2*Y1^3 + X1^3*Y2)
+            sage: W.frobenius_morphism()(W([X1,X2]))  # indirect doctest
+            (X1^3, X2^3)
             sage: WW = WittVectorRing(P, p=3, prec=3, algorithm='standard')
+            sage: WW.sum_polynomials()[1].parent()
+            Multivariate Polynomial Ring in X0, X1, X2, Y0, Y1, Y2 over Multivariate Polynomial Ring in X1, X2, Y1, Y2 over Finite Field of size 3
             sage: V = WittVectorRing(P, p=3, prec=1, algorithm='standard')
+            sage: V.sum_polynomials()[0].parent()
+            Multivariate Polynomial Ring in X0, Y0 over Multivariate Polynomial Ring in X1, X2, Y1, Y2 over Finite Field of size 3
+            sage: W = WittVectorRing(GF(37), prec=2)
+            sage: W.sum_polynomials()[0]
+            X0 + Y0
+            sage: W.prod_polynomials()
+            [X0*Y0, X1*Y0^37 + X0^37*Y1]
+            sage: W.frobenius_polynomials()
+            [X0^37]
         """
+        if p in WittVectorRing._witt_polynomials:
+            if prec > len(WittVectorRing._witt_polynomials[p][0]):
+                WittVectorRing._generate_sum_and_product_polynomials_list(prec, p)
+        else:
+            WittVectorRing._generate_sum_and_product_polynomials_list(prec, p)
+
         var_names = [f'X{i}' for i in range(prec)] + [f'Y{i}' for i in range(prec)]
 
-        (sum_poly, prod_poly) = WittVectorRing._witt_polynomials[p]
         self._sum_polynomials = [None]*prec
         self._prod_polynomials = [None]*prec
+        self._frob_polynomials = [None]*(prec-1)
 
-        # Because ZZ can have a higher precision that prec, we need to create the
-        # homomorphism, as there is no endowed homomorphism from R[X1,Y1] to
-        # ZZ[X1,X2,Y1,Y2]
-        if len(sum_poly) > prec:
-            ZZ_ring = sum_poly[-1].parent()  # TO FIX
-            prec_big = len(sum_poly)
-
-            S = PolynomialRing(coefficient_ring, var_names)
-            Sgens = S.gens()
-            images = []
-
-            for i in range(prec_big):
-                images.append(Sgens[i] if i < prec else S(0))
-            for i in range(prec_big):
-                images.append(Sgens[prec + i] if i < prec else S(0))
-
-            phi = ZZ_ring.hom(images, S)
-
-            for n in range(prec):
-                self._sum_polynomials[n] = phi(sum_poly[n])
-                self._prod_polynomials[n] = phi(prod_poly[n])
-        elif len(sum_poly) == prec:
-            S = PolynomialRing(coefficient_ring, var_names)
-            for n in range(prec):
-                self._sum_polynomials[n] = S(sum_poly[n])
-                self._prod_polynomials[n] = S(prod_poly[n])
-        else:
-            Q = PolynomialRing(ZZ, var_names)
-            S = PolynomialRing(coefficient_ring, var_names)
-            for n in range(prec):
-                self._sum_polynomials[n] = S(Q(sum_poly[n]))
-                self._prod_polynomials[n] = S(Q(prod_poly[n]))
+        # Because the stored Witt/Frobenius polynomials can belong to a ring of
+        # higher precision than `prec`, we need to use indirect coersion
+        # (with 2 rings) because there there is no endowed homomorphism from
+        # ZZ[X1,X2,Y1,Y2] to R[X1,Y1] we need to create ZZ[X1,Y1] in between.
+        # Direct coersion when possible has been tried, but performance
+        # is negligeable to justify its implementation.
+        Q = PolynomialRing(ZZ, var_names)
+        S = PolynomialRing(coefficient_ring, var_names)
+        for n in range(prec):
+            self._sum_polynomials[n] = S(Q(WittVectorRing._witt_polynomials[p][0][n]))
+            self._prod_polynomials[n] = S(Q(WittVectorRing._witt_polynomials[p][1][n]))
+        R = PolynomialRing(ZZ, var_names[:prec])
+        x_vars = R.gens()
+        S = PolynomialRing(coefficient_ring, x_vars)
+        for n in range(prec-1):
+            self._frob_polynomials[n] = S(R(WittVectorRing._frob_polynomials[p][n]))
 
     def _latex_(self) -> str:
         r"""
@@ -635,6 +772,171 @@ class WittVectorRingClass(Parent):
         """
         return self._coefficient_ring
 
+    def frobenius_morphism(self, truncate=False):
+        """
+        Return the Frobenius homomorphism of this ring of Witt vectors.
+
+        INPUT:
+
+        - ``truncate`` -- boolean (default: ``False``); when the coefficient
+          ring has positive characteristic `p`, chose whether to lower the
+          precision of the codomain by `1`. This is always the case when the
+          characteristic of the coefficient ring is not `p`.
+
+        EXAMPLES::
+
+            sage: R.<x,y> = PolynomialRing(QQ)
+            sage: W = WittVectorRing(R, p=5, prec=2)
+            sage: w = W([x, y])
+            sage: frob = W.frobenius_morphism()
+            sage: frob(w)
+            (x^5 + 5*y)
+
+        TESTS::
+
+            sage: TestSuite(frob).run(skip="_test_category")
+        """
+        return WittVectorFrobeniusMorphism(self, truncate=truncate)
+
+    def frobenius_polynomials(self, variables=None):
+        """
+        Return the Witt Frobenius polynomials.
+
+        INPUT:
+
+        - ``variables`` -- names of the indeterminates (default: ``None``),
+          given as a string, or as a list of strings, whose length must be the
+          precision of the ring. When nothing is given, variables indexed by
+          `X` are used.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(5), prec=4)
+            sage: W.frobenius_polynomials()
+            [X0^5, X1^5, X2^5]
+
+            sage: W = WittVectorRing(ZZ, p=2, prec=3)
+            sage: W.frobenius_polynomials('T0, T1, T2')
+            [T0^2 + 2*T1, -2*T0^2*T1 - T1^2 + 2*T2]
+
+            sage: W = WittVectorRing(ZZ, p=3, prec=3)
+            sage: W.frobenius_polynomials('T0, T1, T2')
+            [T0^3 + 3*T1, -3*T0^6*T1 - 9*T0^3*T1^2 - 8*T1^3 + 3*T2]
+        """
+        if not hasattr(self, '_frob_polynomials'):
+            self._generate_witt_polynomials(self._coefficient_ring, self._prec,
+                                            self._prime)
+        if variables is None:
+            return self._frob_polynomials.copy()
+        R = PolynomialRing(self._coefficient_ring, variables)
+        return [R(self._frob_polynomials[i]) for i in range(self._prec-1)]
+
+    def gen(self, n=0):
+        """
+        Return the ``n``-th generator of ``self``.
+
+        .. WARNING::
+
+            This is not the ``n``-th generator of ``self`` as a
+            ``self.base_ring()``-algebra.
+
+        .. SEEALSO::
+
+            :meth:`gens`
+
+        EXAMPLES::
+
+            sage: R.<x, y> = ZZ[]
+            sage: W = WittVectorRing(R, p=3, prec=3)
+            sage: W.gen()
+            (x, 0, 0)
+            sage: W.gen(1)
+            (y, 0, 0)
+            sage: W.gen(n=2)
+            Traceback (most recent call last):
+            ...
+            ValueError: Generator not defined.
+        """
+        return self.teichmuller_lift(self._coefficient_ring.gen(n))
+
+    def gens(self) -> tuple:
+        r"""
+        Return a tuple of generators of ``self``.
+
+        .. WARNING::
+
+            These are not the generators of ``self`` as a
+            ``self.base_ring()``-algebra. Rather, this set generates a
+            sub-``self.base_ring()``-algebra `A` of ``self`` such that every
+            element of ``self`` can be written as `\sum_{i=0}^{prec}V^i(a_i)`
+            where all `a_i\in A`.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(29), prec=3)
+            sage: W.gens()
+            ((1, 0, 0),)
+
+            sage: F.<a> = GF(27)
+            sage: W = WittVectorRing(F, prec=3)
+            sage: W.gens()
+            ((a, 0, 0),)
+
+            sage: R.<x> = ZZ[]
+            sage: W = WittVectorRing(R, p=7, prec=2)
+            sage: W.gens()
+            ((x, 0),)
+        """
+        return tuple(map(self.teichmuller_lift, self._coefficient_ring.gens()))
+
+    def is_exact(self) -> bool:
+        """
+        Return whether the elements of ``self`` are represented exactly.
+
+        EXAMPLES::
+
+            sage: WittVectorRing(ZZ, p=3, prec=3).is_exact()
+            True
+            sage: WittVectorRing(Qp(7), p=7, prec=2).is_exact()
+            False
+        """
+        return self._coefficient_ring.is_exact()
+
+    def is_field(self, proof=True):
+        """
+        Return ``True`` if this ring is a field.
+
+        INPUT:
+
+        - ``proof`` -- boolean (default: ``True``); if set to ``True``, the
+          returned value is correct but the method might throw an exception.
+          Otherwise, if it is set to ``False``, the method returns ``True`` if
+          it can establish that ``self`` is a field, and ``False`` otherwise.
+
+        EXAMPLES::
+
+            sage: WittVectorRing(QQ, p=2).is_field()
+            True
+            sage: WittVectorRing(QQ, p=2, prec=2).is_field()
+            False
+            sage: WittVectorRing(GF(9, 'a')).is_field()
+            True
+            sage: WittVectorRing(GF(9, 'a'), prec=3).is_field()
+            False
+            sage: WittVectorRing(ZZ, p=5).is_field()
+            False
+            sage: L.<z> = LazyLaurentSeriesRing(ZZ)
+            sage: W = WittVectorRing(L, p=7, algorithm="standard")
+            sage: W.is_field(proof=True)
+            Traceback (most recent call last):
+            ...
+            NotImplementedError: unable to determine whether or not Lazy
+            Laurent Series Ring in z over Integer Ring is a field.
+            sage: W.is_field(proof=False)
+            False
+        """
+        return self._prec.is_one() and self._coefficient_ring.is_field(proof=proof)
+
     def is_finite(self) -> bool:
         """
         Return whether ``self`` is a finite ring.
@@ -648,9 +950,128 @@ class WittVectorRingClass(Parent):
         """
         return self._coefficient_ring.is_finite()
 
+    def is_integral_domain(self, proof=True):
+        """
+        Return ``True`` if this ring is an integral domain.
+
+        INPUT:
+
+        - ``proof`` -- boolean (default: ``True``); if set to ``True``, the
+          returned value is correct but the method might throw an exception.
+          Otherwise, if it is set to ``False``, the method returns ``True`` if
+          it can establish that ``self`` is an integral domain, and ``False``
+          otherwise.
+
+        EXAMPLES::
+
+            sage: WittVectorRing(ZZ, p=2).is_integral_domain()
+            True
+            sage: WittVectorRing(ZZ, p=2, prec=2).is_integral_domain()
+            False
+            sage: WittVectorRing(GF(9, 'a')).is_integral_domain()
+            True
+            sage: WittVectorRing(GF(9, 'a'), prec=3).is_integral_domain()
+            False
+            sage: R.<x> = ZZ[]
+            sage: S.<y> = R.quo(x^2 + 7*x + 8)
+            sage: T.<t> = S[]
+            sage: Q.<z> = T.quo(t^2)
+            sage: W = WittVectorRing(Q, p=7, algorithm="standard")
+            sage: W.is_integral_domain(proof=True)
+            Traceback (most recent call last):
+            ...
+            NotImplementedError: cannot rewrite Univariate Quotient
+            Polynomial Ring in y over Integer Ring with modulus
+            x^2 + 7*x + 8 as an isomorphic ring
+            sage: W.is_integral_domain(proof=False)
+            False
+        """
+        return (self._prec.is_one() and
+                self._coefficient_ring.is_integral_domain(proof=proof))
+
+    def is_integrally_closed(self):
+        """
+        Return ``True`` if this ring is an integrally closed domain.
+
+        EXAMPLES::
+
+            sage: x = polygen(ZZ, 'x')
+            sage: K.<a> = NumberField(x^2 + 189*x + 394)
+            sage: R = K.order(2*a)
+            sage: WittVectorRing(R, p=79).is_integrally_closed()
+            False
+            sage: WittVectorRing(ZZ, p=101).is_integrally_closed()
+            True
+            sage: WittVectorRing(ZZ, p=101, prec=2).is_integrally_closed()
+            False
+            sage: S.<t> = ZZ[]
+            sage: WittVectorRing(S, p=101).is_integrally_closed()
+            Traceback (most recent call last):
+            ...
+            NotImplementedError
+        """
+        return (self._prec.is_one() and
+                self._coefficient_ring.is_integrally_closed())
+
+    def is_prime_field(self):
+        r"""
+        Return ``True`` if ``self`` is isomorphic to one of the prime fields
+        `\QQ` or `\GF{p}`.
+
+        EXAMPLES::
+
+            sage: WittVectorRing(QQ, p=2).is_prime_field()
+            True
+            sage: WittVectorRing(QQ, p=2, prec=2).is_prime_field()
+            False
+            sage: WittVectorRing(GF(9, 'a')).is_prime_field()
+            False
+            sage: WittVectorRing(GF(7)).is_prime_field()
+            True
+            sage: WittVectorRing(GF(7), prec=3).is_prime_field()
+            False
+        """
+        return self._prec.is_one() and self._coefficient_ring.is_prime_field()
+
+    def ngens(self) -> int:
+        """
+        Return the number of generators of ``self``.
+
+        .. WARNING::
+
+            This is not the number of generators of ``self`` as a
+            ``self.base_ring()``-algebra.
+
+        .. SEEALSO::
+
+            :meth:`gens`
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(2), p=3, prec=3)
+            sage: W.ngens()
+            1
+            sage: W = WittVectorRing(GF(2)['t'], p=3, prec=3)
+            sage: W.ngens()
+            1
+            sage: W = WittVectorRing(GF(3), p=3, prec=3)
+            sage: W.ngens()
+            1
+            sage: W = WittVectorRing(GF(3)['t'], p=3, prec=3)
+            sage: W.ngens()
+            1
+            sage: W = WittVectorRing(GF(9,'a'), p=3, prec=3)
+            sage: W.ngens()
+            1
+            sage: W = WittVectorRing(GF(9,'a')['t'], p=3, prec=3)
+            sage: W.ngens()
+            1
+        """
+        return len(self.gens())
+
     def precision(self):
         """
-        Return the length of the truncated Witt vectors in ``length``.
+        Return the length of the truncated Witt vectors in ``self``.
 
         EXAMPLES::
 
@@ -700,8 +1121,8 @@ class WittVectorRingClass(Parent):
             [T0*U0, T1*U0^2 + T0^2*U1 + 2*T1*U1]
         """
         if not hasattr(self, '_prod_polynomials'):
-            self._generate_sum_and_product_polynomials(self._coefficient_ring,
-                                                       self._prec, self._prime)
+            self._generate_witt_polynomials(self._coefficient_ring, self._prec,
+                                            self._prime)
         if variables is None:
             return self._prod_polynomials.copy()
         R = PolynomialRing(self._coefficient_ring, variables)
@@ -751,8 +1172,8 @@ class WittVectorRingClass(Parent):
             -X0^3*Y0 - 2*X0^2*Y0^2 - X0*Y0^3 + X0*X1*Y0 + X0*Y0*Y1 - X1*Y1 + X2 + Y2]
         """
         if not hasattr(self, '_sum_polynomials'):
-            self._generate_sum_and_product_polynomials(self._coefficient_ring,
-                                                       self._prec, self._prime)
+            self._generate_witt_polynomials(self._coefficient_ring, self._prec,
+                                            self._prime)
         if variables is None:
             return self._sum_polynomials.copy()
         R = PolynomialRing(self._coefficient_ring, variables)
@@ -772,6 +1193,30 @@ class WittVectorRingClass(Parent):
         if x not in self._coefficient_ring:
             raise TypeError(f"{x} not in {self._coefficient_ring}")
         return self((x,) + tuple(0 for _ in range(self._prec-1)))
+
+    def verschiebung(self, extend=False):
+        """
+        Return the Verschiebung map of this ring of Witt vectors.
+
+        INPUT:
+
+        - ``extend`` -- boolean (default: ``False``); whether the codomain of
+          the map has precision `1` more than ``self``.
+
+        EXAMPLES::
+
+            sage: R.<x,y> = PolynomialRing(QQ)
+            sage: W = WittVectorRing(R, p=5, prec=2)
+            sage: w = W([x, y])
+            sage: V = W.verschiebung()
+            sage: V(w)
+            (0, x)
+
+        TESTS::
+
+            sage: TestSuite(V).run(skip="_test_category")
+        """
+        return WittVectorVerschiebung(self, extend=extend)
 
 
 class WittVectorRing_finotti(WittVectorRingClass):
@@ -824,31 +1269,7 @@ class WittVectorRing_finotti(WittVectorRingClass):
                                    WittVectorRing_standard]
             self._coerce_when_different = [WittVectorRing_phantom]
 
-        import numpy as np
-        R = Zp(prime, prec=prec+1, type='fixed-mod')
-        v_p = ZZ.valuation(prime)
-        table = [[0]]
-        for k in range(1, prec+1):
-            pk = prime**k
-            row = np.empty(pk, dtype=int)
-            row[0] = 0
-            prev_bin = 1
-            for i in range(1, pk // 2 + 1):
-                val = v_p(i)
-                # Instead of calling binomial each time, we compute the
-                # coefficients recursively. This is MUCH faster.
-                next_bin = prev_bin * (pk - (i-1)) // i
-                prev_bin = next_bin
-                series = R(-next_bin // prime**(k-val))
-                for _ in range(val):
-                    temp = series % prime
-                    series = (series - R.teichmuller(temp)) // prime
-                row[i] = ZZ(series % prime)
-                row[pk - i] = row[i]  # binomial coefficients are symmetric
-            table.append(row)
-        self._binomial_table = table
-
-        super().__init__(coefficient_ring, prec, prime)
+        super().__init__(coefficient_ring, prec, prime, "finotti")
 
     def _eta_bar(self, vec, eta_index):
         r"""
@@ -883,7 +1304,7 @@ class WittVectorRing_finotti(WittVectorRingClass):
             # calculate first N_t scriptN's
             for t in range(1, k+1):
                 for i in range(1, p**t):
-                    scriptN[t].append(self._binomial_table[t][i]
+                    scriptN[t].append(WittVectorRing._binomial_table[p][t][i]
                                       * fast_char_p_power(x, i)
                                       * fast_char_p_power(y, p**t - i))
             indexN = [p**i - 1 for i in range(k+1)]
@@ -976,7 +1397,7 @@ class WittVectorRing_phantom(WittVectorRingClass):
                                    WittVectorRing_standard]
             self._coerce_when_different = [WittVectorRing_finotti]
 
-        super().__init__(coefficient_ring, prec, prime)
+        super().__init__(coefficient_ring, prec, prime, "phantom")
 
 
 class WittVectorRing_pinvertible(WittVectorRingClass):
@@ -1023,7 +1444,7 @@ class WittVectorRing_pinvertible(WittVectorRingClass):
                                WittVectorRing_standard]
         self._coerce_when_different = []
 
-        super().__init__(coefficient_ring, prec, prime)
+        super().__init__(coefficient_ring, prec, prime, "p_invertible")
 
 
 class WittVectorRing_standard(WittVectorRingClass):
@@ -1057,9 +1478,431 @@ class WittVectorRing_standard(WittVectorRingClass):
 
             sage: TestSuite(W).run()
         """
-        super().__init__(coefficient_ring, prec, prime)
         self._always_coerce = []
         self._coerce_when_different = [WittVectorRingClass]
 
-        self._generate_sum_and_product_polynomials(coefficient_ring, prec,
-                                                   prime)
+        self._generate_witt_polynomials(coefficient_ring, prec, prime)
+
+        super().__init__(coefficient_ring, prec, prime, "standard")
+
+
+class WittVectorFrobeniusMorphism(RingHomomorphism):
+    """
+    A class implementing Frobenius homomorphisms on Witt vector rings.
+
+    .. WARNING::
+
+        This class should not be called directly, use
+        :meth:`WittVectorRing.frobenius_morphism` instead.
+
+    EXAMPLES::
+
+        sage: R.<x,y,z> = PolynomialRing(ZZ)
+        sage: W = WittVectorRing(R, p=3, prec=3)
+        sage: w = W([x, y, z])
+        sage: frob = W.frobenius_morphism()
+        sage: frob(w)
+        (x^3 + 3*y, -3*x^6*y - 9*x^3*y^2 - 8*y^3 + 3*z)
+
+        sage: W = WittVectorRing(R, p=3, prec=1)
+        sage: W.frobenius_morphism()
+        Traceback (most recent call last):
+        ...
+        ValueError: the ring of Witt vectors must have precision at least 2
+        when truncate=True
+
+    TESTS::
+
+        sage: TestSuite(frob).run(skip="_test_category")
+    """
+    def __init__(self, domain, truncate=False):
+        """
+        INPUT:
+
+        - ``domain`` -- the ring of Witt vectors whose Frobenius endomorphism
+          we are computing.
+
+        - ``truncate`` -- boolean (default: ``False``); when the coefficient
+          ring of the domain has positive characteristic `p`, chose whether to
+          lower the precision of the codomain by `1`. This is always the case
+          when the characteristic of the coefficient ring is not `p`.
+
+        EXAMPLES::
+
+            sage: R.<x,y,z,t> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=4)
+            sage: w = W([x, y, z, t])
+            sage: frob = W.frobenius_morphism()
+            sage: frob(w)
+            (x^5, y^5, z^5, t^5)
+            sage: frob = W.frobenius_morphism(truncate=True)
+            sage: frob(w)
+            (x^5, y^5, z^5)
+
+        TESTS::
+
+            sage: R.<x,y> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=2)
+            sage: frob = W.frobenius_morphism()
+            sage: TestSuite(frob).run(skip="_test_category")
+            sage: frob = W.frobenius_morphism(truncate=True)
+            sage: TestSuite(frob).run(skip="_test_category")
+        """
+
+        coeff_ring = domain.coefficient_ring()
+
+        if not truncate:
+            if coeff_ring.characteristic() != domain.prime():
+                truncate = True
+
+            else:
+                codomain = domain
+                self._call_ = self._call_char_p
+
+        if truncate:
+            prec = domain.precision()
+
+            if prec.is_one():
+                raise ValueError("the ring of Witt vectors must have "
+                                 "precision at least 2 when truncate=True")
+
+            if isinstance(domain, WittVectorRing_finotti):
+                algorithm = "finotti"
+                self._call_ = self._call_char_p_truncate
+            elif isinstance(domain, WittVectorRing_phantom):
+                algorithm = "phantom"
+                self._call_ = self._call_phantom_truncate
+            elif isinstance(domain, WittVectorRing_pinvertible):
+                algorithm = "p_invertible"
+                self._call_ = self._call_standard
+            elif isinstance(domain, WittVectorRing_standard):
+                algorithm = "standard"
+                self._call_ = self._call_standard
+
+            codomain = WittVectorRing(coeff_ring, prec=prec-1,
+                                      p=domain.prime(), algorithm=algorithm)
+
+        super().__init__(Hom(domain, codomain))
+
+    def _call_char_p(self, x):
+        """
+        Evaluate ``self`` at ``x`` when the coefficient ring has characteristic `p`
+        for the non truncated Frobenius.
+
+        EXAMPLES::
+
+            sage: R.<x,y> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=3, algorithm="phantom")
+            sage: w = W([x, x + y, x*y + y])
+            sage: frob = W.frobenius_morphism()
+            sage: frob(w)  # indirect doctest
+            (x^5, x^5 + y^5, x^5*y^5 + y^5)
+
+        TESTS::
+
+            sage: TestSuite(frob).run(skip="_test_category")
+        """
+        W = self.domain()
+        F = W.coefficient_ring().frobenius_endomorphism()
+        return W([F(w) for w in x])
+
+    def _call_char_p_truncate(self, x):
+        """
+        Evaluate ``self`` at ``x`` when the coefficient ring has charaterisic `p`
+        for the truncated Frobenius.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(7), prec=4, algorithm="finotti")
+            sage: w = W([1, 2, 3, 4])
+            sage: frob = W.frobenius_morphism(truncate=True)
+            sage: frob(w)  # indirect doctest
+            (1, 2, 3)
+
+        TESTS::
+
+            sage: TestSuite(frob).run(skip="_test_category")
+        """
+        Wcod = self.codomain()
+        F = Wcod.coefficient_ring().frobenius_endomorphism()
+        return Wcod([F(w) for w in x])
+
+    def _call_phantom_truncate(self, x):
+        """
+        Evaluate ``self`` at ``x`` when the algorithm is ``phantom`` and the
+        Frobenius is truncated.
+
+        EXAMPLES::
+
+            sage: R.<x,y> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=3, algorithm="phantom")
+            sage: w = W([x, x + y, x*y + y])
+            sage: frob = W.frobenius_morphism(truncate=True)
+            sage: fw = frob(w)
+            sage: fw.phantom(lift=True)  # indirect doctest
+            (x^5 + 5*x + 5*y, x^25 + 5*x^5 + 5^2*x^4*y + 2*5^2*x^3*y^2 +
+            2*5^2*x^2*y^3 + 5^2*x*y^4 + 5*y^5 + 5^2*x*y + 5^2*y)
+
+        TESTS::
+
+            sage: TestSuite(frob).run(skip="_test_category")
+        """
+        phantom = x.phantom(lift=True)
+        Wcod = self.codomain()
+        return Wcod(phantom=phantom[1:])
+
+    def _call_standard(self, x):
+        """
+        Evaluate ``self`` at ``x`` using the general algorithm.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(ZZ, p=11, prec=2)
+            sage: w = W([1, 100])
+            sage: frob = W.frobenius_morphism()
+            sage: frob(w)  # indirect doctest
+            (1101)
+
+        TESTS::
+
+            sage: TestSuite(frob).run(skip="_test_category")
+        """
+        W = self.domain()
+        Wcod = self.codomain()
+        return Wcod([W.frobenius_polynomials()[i](x.coordinates())
+                     for i in range(Wcod.precision())])
+
+    def _latex_(self) -> str:
+        r"""
+        Return a `\LaTeX` representation of ``self``.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(PolynomialRing(GF(3),'t'))
+            sage: latex(W.frobenius_morphism())
+            F
+        """
+        return "F"
+
+    def _repr_(self) -> str:
+        """
+        Return a string representation of ``self``.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(11), prec=5)
+            sage: W.frobenius_morphism()
+            Frobenius endomorphism on the Ring of truncated 11-typical Witt
+            vectors of length 5 over Finite Field of size 11
+            sage: W.frobenius_morphism(truncate=True)
+            Frobenius homomorphism from the Ring of truncated 11-typical Witt
+            vectors of length 5 over Finite Field of size 11 to the Ring of
+            truncated 11-typical Witt vectors of length 4 over Finite Field of
+            size 11
+        """
+        if self.domain() is self.codomain():
+            return f"Frobenius endomorphism on the {self.domain()}"
+        return f"Frobenius homomorphism from the {self.domain()} to the "\
+               f"{self.codomain()}"
+
+
+class WittVectorVerschiebung(RingMap):
+    """
+    A class implementing Veschiebung maps on Witt vector rings.
+
+    .. WARNING::
+
+        This class should not be called directly, use
+        :meth:`WittVectorRing.verschiebung` instead.
+
+    EXAMPLES::
+
+        sage: R.<x,y,z> = PolynomialRing(ZZ)
+        sage: W = WittVectorRing(R, p=3, prec=3)
+        sage: w = W([x, y, z])
+        sage: V = W.verschiebung()
+        sage: V(w)
+        (0, x, y)
+
+    TESTS::
+
+        sage: TestSuite(V).run(skip="_test_category")
+    """
+    def __init__(self, domain, extend=False):
+        """
+        INPUT:
+
+        - ``domain`` -- the ring of Witt vectors whose Verschiebung map we are
+          computing.
+
+        - ``extend`` -- boolean (default: ``False``); whether the codomain of
+          the Verschiebung map is a ring of Witt vectors whose lengths are `1`
+          more than the ones in the domain.
+
+        EXAMPLES::
+
+            sage: R.<x,y,z,t> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=4)
+            sage: w = W([x, y, z, t])
+            sage: V = W.verschiebung()
+            sage: V(w)
+            (0, x, y, z)
+            sage: V = W.verschiebung(extend=True)
+            sage: V(w)
+            (0, x, y, z, t)
+
+        TESTS::
+
+            sage: R.<x,y> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=2)
+            sage: V = W.verschiebung()
+            sage: TestSuite(V).run(skip="_test_category")
+            sage: V = W.verschiebung(extend=True)
+            sage: TestSuite(V).run(skip="_test_category")
+        """
+        if extend:
+            prec = domain.precision()
+
+            if isinstance(domain, WittVectorRing_finotti):
+                self._call_ = self._call_extend
+                algorithm = "finotti"
+            elif isinstance(domain, WittVectorRing_phantom):
+                self._call_ = self._call_phantom_extend
+                algorithm = "phantom"
+            elif isinstance(domain, WittVectorRing_pinvertible):
+                self._call_ = self._call_extend
+                algorithm = "p_invertible"
+            elif isinstance(domain, WittVectorRing_standard):
+                self._call_ = self._call_extend
+                algorithm = "standard"
+
+            codomain = WittVectorRing(domain.coefficient_ring(), prec=prec+1,
+                                      p=domain.prime(), algorithm=algorithm)
+
+        else:
+            if isinstance(domain, WittVectorRing_phantom):
+                self._call_ = self._call_phantom_no_extend
+            else:
+                self._call_ = self._call_no_extend
+
+            codomain = domain
+
+        super().__init__(domain.Hom(codomain, CommutativeAdditiveGroups()))
+
+    def _call_extend(self, x):
+        """
+        Evaluate ``self`` at ``x`` for the extended Verschiebung.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(ZZ, p=11, prec=2)
+            sage: w = W([1, 100])
+            sage: V = W.verschiebung(extend=True)
+            sage: V(w)  # indirect doctest
+            (0, 1, 100)
+
+        TESTS::
+
+            sage: TestSuite(V).run(skip="_test_category")
+        """
+        Wcod = self.codomain()
+        R = Wcod.coefficient_ring()
+        return Wcod((R.zero(),) + x.coordinates())
+
+    def _call_no_extend(self, x):
+        """
+        Evaluate ``self`` at ``x`` when the domain is the codomain.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(7), prec=4, algorithm="finotti")
+            sage: w = W([1, 2, 3, 4])
+            sage: V = W.verschiebung()
+            sage: V(w)  # indirect doctest
+            (0, 1, 2, 3)
+
+        TESTS::
+
+            sage: TestSuite(V).run(skip="_test_category")
+        """
+        W = self.domain()
+        R = W.coefficient_ring()
+        return W((R.zero(),) + x.coordinates())
+
+    def _call_phantom_extend(self, x):
+        """
+        Evaluate ``self`` at ``x`` for the extended Verschiebung.
+
+        EXAMPLES::
+
+            sage: R.<x,y> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=3, algorithm="phantom")
+            sage: w = W([x, x + y, x*y + y])
+            sage: V = W.verschiebung(extend=True)
+            sage: V(w)  # indirect doctest
+            (0, x, x + y, x*y + y)
+
+        TESTS::
+
+            sage: TestSuite(V).run(skip="_test_category")
+        """
+        Wcod = self.codomain()
+        p = Wcod.prime()
+        phantom = x.phantom(lift=True)
+        return Wcod(phantom=((phantom[0].parent().zero(),)
+                             + tuple(p*c for c in phantom)))
+
+    def _call_phantom_no_extend(self, x):
+        """
+        Evaluate ``self`` at ``x`` when the domain is the codomain.
+
+        EXAMPLES::
+
+            sage: R.<x,y> = PolynomialRing(GF(5))
+            sage: W = WittVectorRing(R, prec=3, algorithm="phantom")
+            sage: w = W([x, x + y, x*y + y])
+            sage: V = W.verschiebung()
+            sage: V(w)  # indirect doctest
+            (0, x, x + y)
+
+        TESTS::
+
+            sage: TestSuite(V).run(skip="_test_category")
+        """
+        W = self.domain()
+        p = W.prime()
+        phantom = x.phantom(lift=True)
+        return W(phantom=((phantom[0].parent().zero(),)
+                          + tuple(p*c for c in phantom[:-1])))
+
+    def _latex_(self) -> str:
+        r"""
+        Return a `\LaTeX` representation of ``self``.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(PolynomialRing(GF(3),'t'))
+            sage: latex(W.verschiebung())
+            V
+        """
+        return "V"
+
+    def _repr_(self) -> str:
+        """
+        Return a string representation of ``self``.
+
+        EXAMPLES::
+
+            sage: W = WittVectorRing(GF(11), prec=5)
+            sage: W.verschiebung()
+            Verschiebung map on the Ring of truncated 11-typical Witt vectors
+            of length 5 over Finite Field of size 11
+            sage: W.verschiebung(extend=True)
+            Verschiebung map from the Ring of truncated 11-typical Witt vectors
+            of length 5 over Finite Field of size 11 to the Ring of truncated
+            11-typical Witt vectors of length 6 over Finite Field of size 11
+        """
+        if self.domain() is self.codomain():
+            return f"Verschiebung map on the {self.domain()}"
+        return f"Verschiebung map from the {self.domain()} to the "\
+               f"{self.codomain()}"
